@@ -34,24 +34,46 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_DIFF: ${{ steps.diff.outputs.diff }}
         run: |
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "review=ANTHROPIC_API_KEY não configurada. Adicione o secret na org." >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Monta o JSON do request
+          REQUEST=$(jq -n \
+            --arg diff "$PR_DIFF" \
+            --arg title "$PR_TITLE" \
+            --arg body "$PR_BODY" \
+            '{
+              model: "claude-sonnet-4-5-20250514",
+              max_tokens: 2048,
+              messages: [{
+                role: "user",
+                content: ("Você é um code reviewer da Nexx Consulting. Analise este Pull Request e responda em português.\n\nTítulo: " + $title + "\n\nDescrição: " + $body + "\n\nDiff:\n```\n" + $diff + "\n```\n\nAnalise:\n1. Bugs ou erros lógicos\n2. Problemas de segurança (credenciais, SQL injection, XSS)\n3. Melhorias sugeridas\n\nSe não encontrar problemas, diga que o código está ok.\nSeja objetivo e direto.\nUse emojis: 🔴 crítico, 🟡 atenção, 🟢 sugestão.")
+              }]
+            }')
+
+          # Chama a API
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" https://api.anthropic.com/v1/messages \
             -H "Content-Type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
-            -d "$(jq -n \
-              --arg diff "$PR_DIFF" \
-              --arg title "$PR_TITLE" \
-              --arg body "$PR_BODY" \
-              '{
-                model: "claude-sonnet-4-5-20250514",
-                max_tokens: 2048,
-                messages: [{
-                  role: "user",
-                  content: ("Você é um reviewer de código da Nexx Consulting. Analise este PR e responda em português.\n\nTítulo do PR: " + $title + "\n\nDescrição: " + $body + "\n\nDiff:\n```\n" + $diff + "\n```\n\nAnalise:\n1. Bugs ou erros lógicos\n2. Problemas de segurança (credenciais, SQL injection, XSS)\n3. Melhorias sugeridas\n\nSe não encontrar problemas, diga que o código está ok. Seja objetivo e direto. Use emojis para indicar severidade: 🔴 crítico, 🟡 atenção, 🟢 sugestão.")
-                }]
-              }')")
+            -d "$REQUEST")
 
-          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // "Erro ao gerar review."')
+          HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
+
+          echo "API HTTP status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            ERROR_MSG=$(echo "$RESPONSE_BODY" | jq -r '.error.message // "Erro desconhecido"' 2>/dev/null)
+            REVIEW="⚠️ Review automatizado indisponível (HTTP $HTTP_CODE): $ERROR_MSG"
+          else
+            REVIEW=$(echo "$RESPONSE_BODY" | jq -r '.content[0].text // empty')
+            if [ -z "$REVIEW" ]; then
+              REVIEW="⚠️ API retornou resposta vazia."
+            fi
+          fi
 
           EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
           echo "review<<$EOF_MARKER" >> $GITHUB_OUTPUT
@@ -63,6 +85,7 @@ jobs:
         with:
           script: |
             const review = process.env.REVIEW_BODY;
+            if (!review) return;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
